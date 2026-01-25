@@ -2,7 +2,7 @@ name: Fetch gold data every 1 hour
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/15 * * * *"
   workflow_dispatch: {}
 
 concurrency:
