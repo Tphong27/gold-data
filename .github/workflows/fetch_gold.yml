@@ -1,19 +1,19 @@
-name: Fetch gold data every 30 minutes
+name: Fetch & normalize gold data every 1 hour
 
 on:
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "0 * * * *"   # mỗi 1 giờ (UTC)
   workflow_dispatch: {}
 
 concurrency:
-  group: gold-data-30m
+  group: gold-data-1h
   cancel-in-progress: true
 
 permissions:
   contents: write
 
 jobs:
-  fetch:
+  run:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
@@ -29,13 +29,17 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run script
+      - name: Fetch live data
         run: |
           python scripts/fetch_gold.py
+
+      - name: Normalize data
+        run: |
+          python scripts/normalize_test.py
 
       - name: Commit and push if changed
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/gold_live.csv
-          git diff --staged --quiet || (git commit -m "Update gold data" && git push)
+          git add data/gold_live.csv data/gold_clean.csv
+          git diff --staged --quiet || (git commit -m "Update gold data (live+clean)" && git push)
