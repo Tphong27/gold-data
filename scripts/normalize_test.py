@@ -1,9 +1,5 @@
 # scripts/normalize_test.py
-# Normalize + clean gold_live.csv -> gold_clean.csv
-# - Rename day-change columns
-# - Add unit column "Lượng"
-# - Drop update columns
-# - Convert XAUUSD USD/oz -> VND/lượng using real-time mid-market FX
+# Output gold_clean.csv with columns like Google Sheet template
 
 import os
 import re
@@ -20,7 +16,7 @@ FX_CACHE_JSON = "data/fx_cache.json"
 TZ_VN = "Asia/Ho_Chi_Minh"
 
 TEXT_COLS = ["Ngày", "Thời điểm", "Mã vàng", "Loại vàng", "Currency"]
-NUM_COLS = ["Giá mua", "Giá bán", "Day change buy", "Day change sell"]
+NUM_COLS = ["Giá mua", "Giá bán", "Day change buy", "Day change sell", "Số lần update"]
 
 # Unit conversion constants
 GRAMS_PER_OZ_TROY = 31.1034768
@@ -109,12 +105,6 @@ def _save_fx_cache(rate: float):
 
 
 def fetch_usd_vnd_midmarket() -> float:
-    """
-    Fetch USD->VND mid-market FX.
-    Fallback:
-      - Use cache if API fails
-      - Or use env FX_VND_PER_USD if you set it
-    """
     env_fx = os.getenv("FX_VND_PER_USD")
     if env_fx:
         try:
@@ -127,7 +117,6 @@ def fetch_usd_vnd_midmarket() -> float:
         r.raise_for_status()
         data = r.json()
 
-        # open.er-api.com schema: conversion_rates.VND
         rate = None
         conv = data.get("conversion_rates") if isinstance(data, dict) else None
         if isinstance(conv, dict) and "VND" in conv:
@@ -148,7 +137,6 @@ def fetch_usd_vnd_midmarket() -> float:
         if cache and "usd_vnd" in cache:
             print(f"⚠️ FX API failed ({e}). Using cached USD/VND={cache['usd_vnd']}")
             return float(cache["usd_vnd"])
-
         raise RuntimeError(
             f"FX API failed and no cache available. "
             f"Set env FX_VND_PER_USD or fix FX_API_URL. Error: {e}"
@@ -158,88 +146,37 @@ def fetch_usd_vnd_midmarket() -> float:
 def convert_xauusd_to_vnd_luong(df: pd.DataFrame, fx_usd_vnd: float) -> pd.DataFrame:
     """
     Convert rows where Mã vàng == 'XAUUSD' from USD/oz -> VND/lượng.
-    Output:
-      - Giá mua, Giá bán => VND/lượng
-    Preserve original:
-      - buy_usd_oz, sell_usd_oz
+    Also store:
+      - buy_usd_oz (USD/oz)
+      - sell_usd_oz (USD/oz)
+      - fx_usd_vnd (USD/VND)
     """
     df = df.copy()
 
-    # Add unit column
-    df["Lượng"] = "lượng"
-
-    # Identify world gold rows (robust)
     mask = df["Mã vàng"].astype("string").str.upper().eq("XAUUSD")
-    if not mask.any():
-        df["fx_usd_vnd"] = pd.NA
-        return df
+    df["fx_usd_vnd"] = np.nan
+    df.loc[mask, "fx_usd_vnd"] = float(fx_usd_vnd)
 
-    # Store fx for those rows
-    df["fx_usd_vnd"] = pd.NA
-    df.loc[mask, "fx_usd_vnd"] = fx_usd_vnd
-
-    # Preserve original USD/oz in dedicated cols
-    # Ensure these cols are float-friendly
+    # preserve original USD/oz
     df["buy_usd_oz"] = np.nan
     df["sell_usd_oz"] = np.nan
-    df.loc[mask, "buy_usd_oz"] = pd.to_numeric(df.loc[mask, "Giá mua"], errors="coerce").to_numpy(dtype="float64")
-    df.loc[mask, "sell_usd_oz"] = pd.to_numeric(df.loc[mask, "Giá bán"], errors="coerce").to_numpy(dtype="float64")
+    if mask.any():
+        df.loc[mask, "buy_usd_oz"] = pd.to_numeric(df.loc[mask, "Giá mua"], errors="coerce").to_numpy(dtype="float64")
+        df.loc[mask, "sell_usd_oz"] = pd.to_numeric(df.loc[mask, "Giá bán"], errors="coerce").to_numpy(dtype="float64")
 
-    # IMPORTANT FIX:
-    # Force target cols to float before assignment (avoid LossySetitemError)
+    # force numeric
     df["Giá mua"] = pd.to_numeric(df["Giá mua"], errors="coerce").astype("float64")
     df["Giá bán"] = pd.to_numeric(df["Giá bán"], errors="coerce").astype("float64")
 
-    # Convert USD/oz -> VND/lượng; RHS -> numpy array to avoid alignment issues
-    buy_arr = pd.to_numeric(df.loc[mask, "buy_usd_oz"], errors="coerce").to_numpy(dtype="float64")
-    sell_arr = pd.to_numeric(df.loc[mask, "sell_usd_oz"], errors="coerce").to_numpy(dtype="float64")
+    # convert for XAUUSD rows
+    if mask.any():
+        buy_arr = pd.to_numeric(df.loc[mask, "buy_usd_oz"], errors="coerce").to_numpy(dtype="float64")
+        sell_arr = pd.to_numeric(df.loc[mask, "sell_usd_oz"], errors="coerce").to_numpy(dtype="float64")
 
-    df.loc[mask, "Giá mua"] = buy_arr * fx_usd_vnd * OZ_TO_LUONG
-    df.loc[mask, "Giá bán"] = sell_arr * fx_usd_vnd * OZ_TO_LUONG
+        df.loc[mask, "Giá mua"] = buy_arr * fx_usd_vnd * OZ_TO_LUONG
+        df.loc[mask, "Giá bán"] = sell_arr * fx_usd_vnd * OZ_TO_LUONG
+        df.loc[mask, "Currency"] = "VND"
 
-    # Currency after normalization
-    df.loc[mask, "Currency"] = "VND"
-
-    return df
-
-
-def rename_columns(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    rename_map = {
-        "Day change buy": "Chênh lệch giá mua (Hôm qua→Nay)",
-        "Day change sell": "Chênh lệch giá bán (Hôm qua→Nay)",
-    }
-    for k, v in rename_map.items():
-        if k in df.columns:
-            df = df.rename(columns={k: v})
-    return df
-
-
-def drop_unwanted_columns(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    drop_cols = []
-    for c in ["Số lần update", "Thời điểm cập nhật dữ liệu"]:
-        if c in df.columns:
-            drop_cols.append(c)
-    if drop_cols:
-        df = df.drop(columns=drop_cols)
-    return df
-
-
-def add_features(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    if "Giá mua" in df.columns and "Giá bán" in df.columns:
-        df["spread"] = df["Giá bán"] - df["Giá mua"]
-        df["mid"] = (df["Giá mua"] + df["Giá bán"]) / 2
-
-        df = df.sort_values(["Mã vàng", "timestamp_vn"])
-        df["delta_buy"] = df.groupby("Mã vàng")["Giá mua"].diff()
-        df["delta_sell"] = df.groupby("Mã vàng")["Giá bán"].diff()
-    else:
-        df["spread"] = pd.NA
-        df["mid"] = pd.NA
-        df["delta_buy"] = pd.NA
-        df["delta_sell"] = pd.NA
     return df
 
 
@@ -250,6 +187,78 @@ def dedup(df: pd.DataFrame):
     df = df.drop_duplicates(subset="__key", keep="last").drop(columns=["__key"])
     after = len(df)
     return df, before, after
+
+
+def build_output_columns(df: pd.DataFrame, fx_usd_vnd: float) -> pd.DataFrame:
+    """
+    Build final columns like the sheet:
+    Ngày | Thời điểm cập nhật giá mới | Mã vàng | Loại vàng | Giá mua | Giá bán |
+    Tỷ giá USD/VND | Chênh lệch giá VN – TG | Tỷ lệ chênh lệch (%) |
+    Chêch lệch giá mua | Chênh lệch giá bán | Giá tiền đô | unit_standard
+    """
+    df = df.copy()
+
+    # Ensure base
+    df["fx_usd_vnd"] = df.get("fx_usd_vnd")
+    if df["fx_usd_vnd"].isna().all():
+        df["fx_usd_vnd"] = float(fx_usd_vnd)
+
+    # delta buy/sell by code
+    df = df.sort_values(["Mã vàng", "timestamp_vn"])
+    df["diff_buy"] = df.groupby("Mã vàng")["Giá mua"].diff()
+    df["diff_sell"] = df.groupby("Mã vàng")["Giá bán"].diff()
+
+    # World price (TG) per timestamp from XAUUSD (already VND/luong)
+    world = (
+        df[df["Mã vàng"].astype("string").str.upper().eq("XAUUSD")]
+        [["timestamp_vn", "Giá bán", "Giá mua"]]
+        .rename(columns={"Giá bán": "world_sell_vnd", "Giá mua": "world_buy_vnd"})
+        .drop_duplicates(subset=["timestamp_vn"], keep="last")
+    )
+
+    df = df.merge(world, on="timestamp_vn", how="left")
+
+    # Chênh lệch VN – TG: use SELL comparison
+    # Only for VN codes (not XAUUSD)
+    is_world = df["Mã vàng"].astype("string").str.upper().eq("XAUUSD")
+
+    df["diff_vn_world_sell"] = np.where(
+        (~is_world) & df["world_sell_vnd"].notna(),
+        df["Giá bán"] - df["world_sell_vnd"],
+        np.nan
+    )
+
+    df["diff_pct"] = np.where(
+        (~is_world) & df["world_sell_vnd"].notna() & (df["world_sell_vnd"] != 0),
+        (df["diff_vn_world_sell"] / df["world_sell_vnd"]) * 100.0,
+        np.nan
+    )
+
+    # unit_standard
+    df["unit_standard"] = "VND/lượng"
+
+    # "Giá tiền đô" -> keep raw USD/oz buy (for world row), else blank
+    df["gia_tien_do"] = df.get("buy_usd_oz")
+    df.loc[~is_world, "gia_tien_do"] = np.nan
+
+    # Build final dataframe with sheet headers
+    out = pd.DataFrame({
+        "Ngày": df["Ngày"],
+        "Thời điểm cập nhật giá mới": df["Thời điểm"],
+        "Mã vàng": df["Mã vàng"],
+        "Loại vàng": df["Loại vàng"],
+        "Giá mua": df["Giá mua"],
+        "Giá bán": df["Giá bán"],
+        "Tỷ giá USD/VND": df["fx_usd_vnd"],
+        "Chênh lệch giá VN – TG (giá bán VN - giá bán TG)": df["diff_vn_world_sell"],
+        "Tỷ lệ chênh lệch (%)": df["diff_pct"],
+        "Chêch lệch giá mua": df["diff_buy"],
+        "Chênh lệch giá bán": df["diff_sell"],
+        "Giá tiền đô": df["gia_tien_do"],
+        "unit_standard": df["unit_standard"],
+    })
+
+    return out
 
 
 def main():
@@ -264,42 +273,28 @@ def main():
     print("Loaded:", df.shape)
     print("Columns:", list(df.columns))
 
-    # 1) clean text columns
     ensure_text(df)
-
-    # 2) parse VN timestamp
     parse_timestamp_vn(df)
-
-    # 3) convert numerics
     ensure_numeric(df)
 
-    # 4) fetch FX mid-market + convert XAUUSD USD/oz -> VND/lượng
     fx_usd_vnd = fetch_usd_vnd_midmarket()
     print(f"FX USD/VND used (mid-market): {fx_usd_vnd}")
 
     df = convert_xauusd_to_vnd_luong(df, fx_usd_vnd)
 
-    # 5) drop unwanted columns
-    df = drop_unwanted_columns(df)
-
-    # 6) rename columns
-    df = rename_columns(df)
-
-    # 7) add features
-    df = add_features(df)
-
-    # 8) dedup & sort
+    # Dedup and sort
     df, before, after = dedup(df)
-    df = df.sort_values(["Mã vàng", "timestamp_vn"])
+    df = df.sort_values(["timestamp_vn", "Mã vàng"])
 
-    # 9) save
+    # Build final output columns per sheet
+    out = build_output_columns(df, fx_usd_vnd)
+
     os.makedirs(os.path.dirname(OUT_CLEAN) or ".", exist_ok=True)
-    df.to_csv(OUT_CLEAN, index=False)
+    out.to_csv(OUT_CLEAN, index=False)
 
     print(f"✅ Saved: {OUT_CLEAN}")
     print(f"dedup: {before} -> {after}")
-    print("null timestamp:", int(df["timestamp_vn"].isna().sum()))
-    print("time range:", df["timestamp_vn"].min(), "->", df["timestamp_vn"].max())
+    print("null timestamp:", int(pd.to_datetime(out["Ngày"].astype(str) + " " + out["Thời điểm cập nhật giá mới"].astype(str), errors="coerce").isna().sum()))
 
 
 if __name__ == "__main__":
