@@ -1,16 +1,22 @@
+# scripts/fetch_gold.py
+# Fetch gold data from Google Sheets (XLSX export) and save:
+# - data/gold_live_new.csv (table)
+# - data/gold_live_raw_new.log (timestamp + JSON, 1 line / snapshot, dedup by timestamp)
+
 import os
 import re
 import pandas as pd
 
 SHEET_ID = "12IidFzGCo4yzUN77SqUTiUsF4qLp7RtAMSUR35IhCKs"
-INPUT_XLSX = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=xlsx"
+INPUT_XLSX_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=xlsx"
 
 OUT_TABLE_NEW = "data/gold_live_new.csv"
-OUT_RAW_NEW = "data/gold_live_raw_new.csv"
+OUT_RAW_LOG = "data/gold_live_raw_new.log"
 
-SHEET_TABLE = "GOLD_PRICE"
+SHEET_PRICE = "GOLD_PRICE"
 SHEET_RAW = "RAW_DATA"
 
+# Headers expected in GOLD_PRICE
 HEADERS_TABLE = [
     "Ngày",
     "Thời điểm cập nhật giá mới",
@@ -26,172 +32,183 @@ HEADERS_TABLE = [
 ]
 
 
-def fetch_from_sheets(url: str):
-    """Đọc dữ liệu từ Google Sheets qua link export XLSX"""
+def fetch_from_sheets(xlsx_url: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Read GOLD_PRICE and RAW_DATA from Google Sheets export XLSX.
+    Requirements: the sheet must be shared as "Anyone with the link can view".
+    """
     try:
-        df_price = pd.read_excel(url, sheet_name=SHEET_TABLE)
-        df_raw = pd.read_excel(url, sheet_name=SHEET_RAW)
+        df_price = pd.read_excel(xlsx_url, sheet_name=SHEET_PRICE)
+        # Read RAW_DATA as string to avoid datetime/JSON coercion
+        df_raw = pd.read_excel(xlsx_url, sheet_name=SHEET_RAW, dtype=str)
         return df_price, df_raw
     except Exception as e:
         raise RuntimeError(
-            "Không thể đọc Google Sheet. Hãy đảm bảo sheet đã share public (Anyone with the link can view). "
+            "Không thể đọc Google Sheet. Hãy đảm bảo sheet đã bật "
+            "'Bất kỳ ai có liên kết đều có thể xem'. "
             f"Lỗi: {e}"
         )
 
 
-def normalize_table_columns(df: pd.DataFrame) -> pd.DataFrame:
+def _ensure_headers_table(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Chuẩn hóa tên cột GOLD_PRICE:
-    - strip khoảng trắng
-    - sửa trường hợp copy/paste bị dính chữ: 'Day change buyDay change sellCurrency'
-      (đôi khi sheet export bị lỗi header)
+    Ensure GOLD_PRICE has all required columns and in correct order.
+    Missing columns will be created as empty.
     """
     df = df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
-
-    # Fix một số trường hợp header bị dính (nếu có)
-    joined = "".join(df.columns)
-    if "Day change buyDay change sellCurrency" in joined:
-        # Trường hợp xấu: export ra 1 cột dính 3 tên -> rất hiếm.
-        # Nếu gặp, bạn cần chỉnh lại sheet header. Ở đây chỉ cảnh báo.
-        print("⚠️ Cảnh báo: Header có dấu hiệu bị dính 'Day change buyDay change sellCurrency'. Hãy kiểm tra lại sheet.")
-
-    # Fix trường hợp tên cột thiếu khoảng trắng kiểu "Day change buyDay change sell"
-    # (nếu excel đọc ra đúng 2 cột thì không cần)
-    rename_map = {}
-    for c in df.columns:
-        if c.replace(" ", "") == "Daychangebuy":
-            rename_map[c] = "Day change buy"
-        if c.replace(" ", "") == "Daychangesell":
-            rename_map[c] = "Day change sell"
-        if c.replace(" ", "") == "Solanupdate":
-            rename_map[c] = "Số lần update"
-
-    if rename_map:
-        df = df.rename(columns=rename_map)
-
-    return df
-
-
-def align_table_schema(df: pd.DataFrame) -> pd.DataFrame:
-    """Ép GOLD_PRICE về đúng schema/đúng thứ tự cột"""
-    df = df.copy()
-
-    # đảm bảo đủ cột
     for col in HEADERS_TABLE:
         if col not in df.columns:
-            df[col] = pd.NA
-
-    # chỉ lấy đúng cột cần theo thứ tự
-    df = df[HEADERS_TABLE].copy()
-
-    # strip text cho các cột text
-    for c in ["Ngày", "Thời điểm cập nhật giá mới", "Thời điểm cập nhật dữ liệu", "Mã vàng", "Loại vàng", "Currency"]:
-        df[c] = df[c].astype("string").str.strip()
-
-    return df
+            df[col] = ""
+    return df[HEADERS_TABLE]
 
 
-def _read_existing_lines(path: str) -> set[str]:
-    if not os.path.exists(path) or os.path.getsize(path) == 0:
-        return set()
-    with open(path, "r", encoding="utf-8") as f:
-        return set(line.rstrip("\n") for line in f if line.strip())
-
-
-RAW_TS_RE = re.compile(r"^\s*(\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2})\s*(\{.*\})\s*$")
-
-
-def normalize_raw_line(line: str) -> str | None:
+def save_dedup_table(df_new: pd.DataFrame) -> None:
     """
-    RAW mẫu: 25/01/2026 14:46:44{"success":true,...}
-    -> chuẩn hóa thành: 25/01/2026 14:46:44 {...json...}
-    """
-    if not line:
-        return None
-    s = str(line).strip()
-    if not s or s.lower() == "nan":
-        return None
-
-    m = RAW_TS_RE.match(s)
-    if m:
-        ts, js = m.group(1), m.group(2)
-        return f"{ts} {js}"
-
-    # fallback: nếu không match regex, vẫn ghi nguyên dòng để khỏi mất dữ liệu
-    return s
-
-
-def process_raw_to_json_log(df_raw: pd.DataFrame):
-    """
-    RAW_DATA của bạn là 1 cột chứa cả datetime + json.
-    Ghi ra OUT_RAW_NEW dạng 1 dòng / snapshot, có dedup để không ghi trùng vô hạn.
-    """
-    os.makedirs(os.path.dirname(OUT_RAW_NEW), exist_ok=True)
-
-    existing = _read_existing_lines(OUT_RAW_NEW)
-    new_lines = []
-
-    # Lấy từng row, ưu tiên cell đầu tiên (cột A)
-    for _, row in df_raw.iterrows():
-        raw_cell = row.iloc[0] if len(row) > 0 else None
-        line = normalize_raw_line(raw_cell)
-        if not line or line in existing:
-            continue
-        new_lines.append(line)
-
-    if not new_lines:
-        print("ℹ️ RAW log: không có dòng mới để ghi.")
-        return
-
-    with open(OUT_RAW_NEW, "a", encoding="utf-8") as f:
-        for line in new_lines:
-            f.write(line + "\n")
-
-    print(f"✅ RAW log: đã ghi thêm {len(new_lines)} dòng vào {OUT_RAW_NEW}")
-
-
-def save_dedup_table(df_new: pd.DataFrame):
-    """
-    Lưu GOLD_PRICE dạng bảng và khử trùng theo:
-    Ngày + Thời điểm cập nhật giá mới + Mã vàng
+    Save GOLD_PRICE to OUT_TABLE_NEW and deduplicate by:
+    Ngày | Thời điểm cập nhật giá mới | Mã vàng
     """
     os.makedirs(os.path.dirname(OUT_TABLE_NEW), exist_ok=True)
 
-    df_new = align_table_schema(df_new)
+    df_new = _ensure_headers_table(df_new)
 
     if (not os.path.exists(OUT_TABLE_NEW)) or (os.path.getsize(OUT_TABLE_NEW) == 0):
         df_new.to_csv(OUT_TABLE_NEW, index=False, encoding="utf-8-sig")
-        print(f"✅ Đã tạo bảng: {OUT_TABLE_NEW} rows={len(df_new)}")
+        print(f"✅ Created table: {OUT_TABLE_NEW} rows={len(df_new)}")
         return
 
-    df_old = pd.read_csv(OUT_TABLE_NEW, encoding="utf-8-sig", dtype="string")
-    df_all = pd.concat([df_old, df_new.astype("string")], ignore_index=True)
+    try:
+        df_old = pd.read_csv(OUT_TABLE_NEW, dtype=str, keep_default_na=False)
+    except Exception as e:
+        df_new.to_csv(OUT_TABLE_NEW, index=False, encoding="utf-8-sig")
+        print(f"⚠️ Recreated table due to read error ({e}): {OUT_TABLE_NEW} rows={len(df_new)}")
+        return
+
+    df_old = _ensure_headers_table(df_old)
+    df_new = df_new.astype(str)
+
+    df_all = pd.concat([df_old, df_new], ignore_index=True)
 
     key_col = "Thời điểm cập nhật giá mới"
     df_all["__key"] = (
-        df_all["Ngày"].astype(str) + "|" +
-        df_all[key_col].astype(str) + "|" +
-        df_all["Mã vàng"].astype(str)
+        df_all["Ngày"].astype(str).str.strip() + "|" +
+        df_all[key_col].astype(str).str.strip() + "|" +
+        df_all["Mã vàng"].astype(str).str.strip()
     )
-
     before = len(df_all)
     df_all = df_all.drop_duplicates(subset="__key", keep="last").drop(columns=["__key"])
     after = len(df_all)
 
     df_all = df_all.sort_values(["Ngày", key_col, "Mã vàng"])
     df_all.to_csv(OUT_TABLE_NEW, index=False, encoding="utf-8-sig")
+    print(f"✅ Updated table: {OUT_TABLE_NEW} rows={after} (dedup {before}->{after})")
 
-    print(f"✅ Đã cập nhật bảng: {OUT_TABLE_NEW} rows={after} (dedup {before}->{after})")
+
+_TS_JSON_RE = re.compile(r"^\s*(\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2})\s*(\{.*)$")
+
+
+def _split_raw_line(ts_or_line: str, maybe_json: str | None) -> tuple[str | None, str | None]:
+    """
+    Normalize RAW_DATA record into (timestamp_str, json_str).
+    Supports:
+      - 2 columns: (timestamp, json)
+      - 1 column: "dd/MM/yyyy HH:mm:ss{...}" or "dd/MM/yyyy HH:mm:ss {...}"
+    """
+    if ts_or_line is None:
+        return None, None
+
+    a = str(ts_or_line).strip()
+    b = None if maybe_json is None else str(maybe_json).strip()
+
+    if a.lower() == "nan" or a == "":
+        return None, None
+
+    # If we already have JSON in column B
+    if b and b.lower() != "nan":
+        # Ensure b starts at first '{'
+        if "{" in b:
+            b = b[b.find("{"):]
+        return a, b
+
+    # Otherwise parse from single combined line in column A
+    m = _TS_JSON_RE.match(a)
+    if m:
+        ts = m.group(1).strip()
+        js = m.group(2).strip()
+        return ts, js
+
+    # As a fallback: if it's just timestamp without json -> ignore
+    if a.startswith("{") and a.endswith("}"):
+        # no timestamp found
+        return None, a
+
+    return None, None
+
+
+def append_dedup_raw_log(df_raw: pd.DataFrame) -> None:
+    """
+    Append RAW_DATA to OUT_RAW_LOG in format:
+      dd/MM/yyyy HH:mm:ss <json>
+    Dedup by timestamp to avoid file growing too fast.
+    """
+    os.makedirs(os.path.dirname(OUT_RAW_LOG), exist_ok=True)
+
+    # Build set of existing timestamps
+    existing_ts: set[str] = set()
+    if os.path.exists(OUT_RAW_LOG) and os.path.getsize(OUT_RAW_LOG) > 0:
+        try:
+            with open(OUT_RAW_LOG, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    # timestamp is first 19 chars: dd/MM/yyyy HH:mm:ss
+                    ts = line[:19].strip()
+                    if ts:
+                        existing_ts.add(ts)
+        except Exception as e:
+            # If file can't be read, do not block pipeline—just continue appending
+            print(f"⚠️ Could not read existing raw log for dedup ({e}). Will append anyway.")
+            existing_ts = set()
+
+    wrote = 0
+    skipped = 0
+
+    with open(OUT_RAW_LOG, "a", encoding="utf-8") as f:
+        for _, row in df_raw.iterrows():
+            col_a = row.iloc[0] if len(row) > 0 else None
+            col_b = row.iloc[1] if len(row) > 1 else None
+
+            ts, js = _split_raw_line(col_a, col_b)
+            if not ts or not js:
+                continue
+
+            # normalize json to start with '{'
+            if "{" in js:
+                js = js[js.find("{"):]
+            js = js.strip()
+
+            # dedup by timestamp
+            if ts in existing_ts:
+                skipped += 1
+                continue
+
+            f.write(f"{ts} {js}\n")
+            existing_ts.add(ts)
+            wrote += 1
+
+    print(f"✅ Raw log updated: {OUT_RAW_LOG} wrote={wrote} skipped_existing={skipped}")
+
+
+def main():
+    print("🔄 Đang tải dữ liệu từ Google Sheet (XLSX export)...")
+    df_price, df_raw = fetch_from_sheets(INPUT_XLSX_URL)
+
+    # 1) RAW log: timestamp + JSON (dedup by timestamp)
+    append_dedup_raw_log(df_raw)
+
+    # 2) Table: GOLD_PRICE -> CSV (dedup by Ngày|Thời điểm cập nhật giá mới|Mã vàng)
+    save_dedup_table(df_price)
 
 
 if __name__ == "__main__":
-    print("🔄 Đang tải dữ liệu từ Google Sheet...")
-    price_data, raw_data = fetch_from_sheets(INPUT_XLSX)
-
-    # chuẩn hóa header GOLD_PRICE
-    price_data = normalize_table_columns(price_data)
-
-    # ghi raw + bảng
-    process_raw_to_json_log(raw_data)
-    save_dedup_table(price_data)
+    main()
