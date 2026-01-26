@@ -10,6 +10,7 @@ import re
 import json
 from datetime import datetime, timezone
 
+import numpy as np
 import pandas as pd
 import requests
 
@@ -157,36 +158,44 @@ def fetch_usd_vnd_midmarket() -> float:
 def convert_xauusd_to_vnd_luong(df: pd.DataFrame, fx_usd_vnd: float) -> pd.DataFrame:
     """
     Convert rows where Mã vàng == 'XAUUSD' from USD/oz -> VND/lượng.
-    We'll output standardized VND prices in columns:
-      - Giá mua (VND/lượng)
-      - Giá bán (VND/lượng)
-    Also keep original USD columns in:
-      - Giá mua (USD/oz) gốc -> buy_usd_oz
-      - Giá bán (USD/oz) gốc -> sell_usd_oz
+    Output:
+      - Giá mua, Giá bán => VND/lượng
+    Preserve original:
+      - buy_usd_oz, sell_usd_oz
     """
     df = df.copy()
 
-    # Add unit column required by user
+    # Add unit column
     df["Lượng"] = "lượng"
 
-    # Identify world gold rows
-    mask = df["Mã vàng"].astype(str).eq("XAUUSD")
+    # Identify world gold rows (robust)
+    mask = df["Mã vàng"].astype("string").str.upper().eq("XAUUSD")
     if not mask.any():
         df["fx_usd_vnd"] = pd.NA
         return df
 
+    # Store fx for those rows
     df["fx_usd_vnd"] = pd.NA
     df.loc[mask, "fx_usd_vnd"] = fx_usd_vnd
 
-    # Preserve original USD/oz
-    df["buy_usd_oz"] = pd.NA
-    df["sell_usd_oz"] = pd.NA
-    df.loc[mask, "buy_usd_oz"] = df.loc[mask, "Giá mua"]
-    df.loc[mask, "sell_usd_oz"] = df.loc[mask, "Giá bán"]
+    # Preserve original USD/oz in dedicated cols
+    # Ensure these cols are float-friendly
+    df["buy_usd_oz"] = np.nan
+    df["sell_usd_oz"] = np.nan
+    df.loc[mask, "buy_usd_oz"] = pd.to_numeric(df.loc[mask, "Giá mua"], errors="coerce").to_numpy(dtype="float64")
+    df.loc[mask, "sell_usd_oz"] = pd.to_numeric(df.loc[mask, "Giá bán"], errors="coerce").to_numpy(dtype="float64")
 
-    # Convert to VND/luong
-    df.loc[mask, "Giá mua"] = df.loc[mask, "buy_usd_oz"] * fx_usd_vnd * OZ_TO_LUONG
-    df.loc[mask, "Giá bán"] = df.loc[mask, "sell_usd_oz"] * fx_usd_vnd * OZ_TO_LUONG
+    # IMPORTANT FIX:
+    # Force target cols to float before assignment (avoid LossySetitemError)
+    df["Giá mua"] = pd.to_numeric(df["Giá mua"], errors="coerce").astype("float64")
+    df["Giá bán"] = pd.to_numeric(df["Giá bán"], errors="coerce").astype("float64")
+
+    # Convert USD/oz -> VND/lượng; RHS -> numpy array to avoid alignment issues
+    buy_arr = pd.to_numeric(df.loc[mask, "buy_usd_oz"], errors="coerce").to_numpy(dtype="float64")
+    sell_arr = pd.to_numeric(df.loc[mask, "sell_usd_oz"], errors="coerce").to_numpy(dtype="float64")
+
+    df.loc[mask, "Giá mua"] = buy_arr * fx_usd_vnd * OZ_TO_LUONG
+    df.loc[mask, "Giá bán"] = sell_arr * fx_usd_vnd * OZ_TO_LUONG
 
     # Currency after normalization
     df.loc[mask, "Currency"] = "VND"
