@@ -2,7 +2,7 @@ name: Fetch & normalize gold data every 1 hour
 
 on:
   schedule:
-    - cron: "0 * * * *"   # Chạy mỗi 1 giờ (UTC)
+    - cron: "0 * * * *"   # every 1 hour (UTC)
   workflow_dispatch: {}
 
 concurrency:
@@ -18,6 +18,8 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -33,7 +35,7 @@ jobs:
         run: |
           python scripts/fetch_gold.py
 
-      - name: Normalize data
+      - name: Normalize data (build gold_clean_new.csv)
         run: |
           python scripts/normalize_test.py
 
@@ -41,6 +43,20 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          # Cập nhật đường dẫn các file csv mới để git theo dõi
-          git add data/gold_live_new.csv data/gold_live_raw_new.csv data/gold_clean_new.csv
-          git diff --staged --quiet || (git commit -m "Update gold data (live_new + clean_new)" && git push)
+
+          # Add ONLY the new outputs
+          git add \
+            data/gold_live_new.csv \
+            data/gold_live_raw_new.csv \
+            data/gold_clean_new.csv \
+            data/fx_cache.json
+
+          # If nothing staged -> exit 0
+          git diff --staged --quiet && exit 0
+
+          git commit -m "Update gold data (live+raw+clean)"
+
+          # Avoid push failures if remote advanced
+          git pull --rebase origin main
+
+          git push origin main
