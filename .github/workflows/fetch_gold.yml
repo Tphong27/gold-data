@@ -1,62 +1,138 @@
+# .github/workflows/fetch_gold.yml
+# -----------------------------------------------------------------------------
+# WORKFLOW: Fetch & Normalize Gold Data
+#
+# MỤC TIÊU
+# - Mỗi 1 giờ: tải dữ liệu từ Google Sheets (XLSX export)
+# - Lưu ra:
+#   - data/gold_live_new.csv        (bảng thô)
+#   - data/gold_live_raw_new.log    (raw json log)
+#   - data/gold_clean_new.csv       (bảng đã chuẩn hoá)
+#   - data/fx_cache.json            (cache tỷ giá USD/VND để fallback)
+# - Nếu có thay đổi file -> commit + push lên repo
+#
+# LƯU Ý
+# - Cron của GitHub Actions chạy theo UTC.
+# - Cron không đảm bảo chạy đúng "đúng phút 0" tuyệt đối (có thể trễ vài phút).
+# - Workflow chỉ push khi có thay đổi file (git diff --staged --quiet).
+# -----------------------------------------------------------------------------
+
 name: Fetch & normalize gold data every 1 hour
 
 on:
+  # Lịch chạy tự động
   schedule:
+    # "0 * * * *" => phút 0 của mỗi giờ (UTC)
+    # Ví dụ: 01:00 UTC, 02:00 UTC, ...
     - cron: "0 * * * *"   # every 1 hour (UTC)
+
+  # Cho phép bấm Run workflow thủ công trên tab Actions
   workflow_dispatch: {}
 
+# -----------------------------------------------------------------------------
+# CONCURRENCY
+# - Tránh trường hợp workflow bị xếp hàng chạy chồng lên nhau (ví dụ repo lag)
+# - cancel-in-progress: true => nếu job mới bắt đầu, job cũ đang chạy sẽ bị huỷ
+# -----------------------------------------------------------------------------
 concurrency:
   group: gold-data-1h
   cancel-in-progress: true
 
+# -----------------------------------------------------------------------------
+# PERMISSIONS
+# - contents: write => cần quyền ghi để commit/push lên repo
+# -----------------------------------------------------------------------------
 permissions:
   contents: write
 
 jobs:
   run:
+    # Máy ảo chạy job
     runs-on: ubuntu-latest
+
     steps:
+      # -----------------------------------------------------------------------
+      # 1) Checkout source code từ repo
+      # fetch-depth: 0 => lấy full history để tránh lỗi khi git pull --rebase
+      # -----------------------------------------------------------------------
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
+      # -----------------------------------------------------------------------
+      # 2) Cài Python môi trường chạy script
+      # -----------------------------------------------------------------------
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
+      # -----------------------------------------------------------------------
+      # 3) Cài dependencies
+      # - requirements.txt phải có: pandas, openpyxl, requests, numpy, ...
+      # -----------------------------------------------------------------------
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # -----------------------------------------------------------------------
+      # 4) Fetch live data
+      # - scripts/fetch_gold.py sẽ:
+      #   + tải XLSX export từ Google Sheets (public)
+      #   + update data/gold_live_new.csv (dedup theo snapshot+code)
+      #   + update data/gold_live_raw_new.log (dedup theo timestamp)
+      # -----------------------------------------------------------------------
       - name: Fetch live data (from Google Sheets)
         run: |
           python scripts/fetch_gold.py
 
+      # -----------------------------------------------------------------------
+      # 5) Normalize data
+      # - scripts/normalize_test.py sẽ:
+      #   + đọc data/gold_live_new.csv
+      #   + fetch tỷ giá USD/VND (FX_API_URL) hoặc dùng cache
+      #   + convert XAUUSD (USD/oz) -> VND/lượng
+      #   + tính VN vs TG + diff theo thời gian
+      #   + xuất data/gold_clean_new.csv
+      # -----------------------------------------------------------------------
       - name: Normalize data (build gold_clean_new.csv)
         run: |
           python scripts/normalize_test.py
 
+      # -----------------------------------------------------------------------
+      # 6) Commit & push nếu có thay đổi
+      #
+      # Giải thích:
+      # - git add chỉ add đúng 4 file output (tránh commit nhầm file khác)
+      # - git diff --staged --quiet:
+      #     + exit code 0 => không có thay đổi staged => dừng workflow (exit 0)
+      #     + exit code 1 => có thay đổi => commit/push
+      # - git pull --rebase origin main:
+      #     tránh lỗi "non-fast-forward" nếu remote có commit mới
+      # -----------------------------------------------------------------------
       - name: Commit and push if changed
         run: |
+          # set identity cho commit từ GitHub Actions bot
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Add ONLY the new outputs
+          # Chỉ add các file output mong muốn
           git add \
             data/gold_live_new.csv \
             data/gold_live_raw_new.log \
             data/gold_clean_new.csv \
             data/fx_cache.json
 
-          # If nothing staged -> exit 0
+          # Nếu không có gì thay đổi sau khi add => thoát êm (không commit)
           git diff --staged --quiet && exit 0
 
+          # Có thay đổi => commit
           git commit -m "Update gold data (live+raw+clean)"
 
-          # Avoid push failures if remote advanced
+          # Nếu remote có thay đổi (commit khác) => rebase cho sạch lịch sử
           git pull --rebase origin main
 
+          # Push lên nhánh main
           git push origin main
