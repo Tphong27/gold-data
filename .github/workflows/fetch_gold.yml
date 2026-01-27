@@ -47,7 +47,7 @@ jobs:
           # Add ONLY the new outputs
           git add \
             data/gold_live_new.csv \
-            data/gold_live_raw_new.csv \
+            data/gold_live_raw_new.log \
             data/gold_clean_new.csv \
             data/fx_cache.json
 
