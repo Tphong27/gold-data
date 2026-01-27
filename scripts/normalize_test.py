@@ -193,9 +193,7 @@ def convert_xauusd_to_vnd_luong(df: pd.DataFrame, fx_usd_vnd: float) -> pd.DataF
 
 
 def dedup(df: pd.DataFrame):
-    """
-    Dedup by snapshot timestamp + code
-    """
+    """Dedup by snapshot timestamp + code"""
     df = df.copy()
     df["__key"] = df["timestamp_vn"].astype(str) + "|" + df["Mã vàng"].astype(str)
     before = len(df)
@@ -211,14 +209,13 @@ def build_output(df: pd.DataFrame) -> pd.DataFrame:
       Thời điểm cập nhật giá mới
       Mã vàng
       Loại vàng
-      Giá mua
-      Giá bán
+      Giá mua (VND/lượng)
+      Giá bán (VND/lượng)
       Tỷ giá USD/VND
       Chênh lệch giá VN – TG
       Tỷ lệ chênh lệch (%)
-      Chênh lệch giá mua
-      Chênh lệch giá bán
-    All prices are VND/lượng (including TG after XAUUSD conversion)
+      Chênh lệch giá mua (VND/lượng)
+      Chênh lệch giá bán (VND/lượng)
     """
     df = df.copy()
 
@@ -229,8 +226,7 @@ def build_output(df: pd.DataFrame) -> pd.DataFrame:
 
     # world price by timestamp from XAUUSD (already VND/lượng)
     world = (
-        df[df["Mã vàng"].astype("string").str.upper().eq("XAUUSD")]
-        [["timestamp_vn", "Giá bán", "Giá mua"]]
+        df[df["Mã vàng"].astype("string").str.upper().eq("XAUUSD")][["timestamp_vn", "Giá bán", "Giá mua"]]
         .rename(columns={"Giá bán": "world_sell_vnd", "Giá mua": "world_buy_vnd"})
         .drop_duplicates(subset=["timestamp_vn"], keep="last")
     )
@@ -259,15 +255,28 @@ def build_output(df: pd.DataFrame) -> pd.DataFrame:
             "Thời điểm cập nhật giá mới": df["Thời điểm cập nhật giá mới"],
             "Mã vàng": df["Mã vàng"],
             "Loại vàng": df["Loại vàng"],
-            "Giá mua": df["Giá mua"],
-            "Giá bán": df["Giá bán"],
+            "Giá mua (VND/lượng)": df["Giá mua"],
+            "Giá bán (VND/lượng)": df["Giá bán"],
             "Tỷ giá USD/VND": df["fx_usd_vnd"],
             "Chênh lệch giá VN – TG": df["diff_vn_tg"],
             "Tỷ lệ chênh lệch (%)": df["diff_pct"],
-            "Chênh lệch giá mua": df["diff_buy"],
-            "Chênh lệch giá bán": df["diff_sell"],
+            "Chênh lệch giá mua (VND/lượng)": df["diff_buy"],
+            "Chênh lệch giá bán (VND/lượng)": df["diff_sell"],
         }
     )
+
+    # Round requested numeric columns to 2 decimals
+    round_cols = [
+        "Giá mua (VND/lượng)",
+        "Giá bán (VND/lượng)",
+        "Chênh lệch giá VN – TG",
+        "Chênh lệch giá mua (VND/lượng)",
+        "Chênh lệch giá bán (VND/lượng)",
+        "Tỷ lệ chênh lệch (%)",
+    ]
+    for c in round_cols:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce").round(2)
 
     # final sort nicer for sheet
     out["_ts"] = pd.to_datetime(
