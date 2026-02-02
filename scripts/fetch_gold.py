@@ -26,6 +26,10 @@ INPUT_XLSX_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?form
 # ========== OUTPUT FILES ==========
 OUT_TABLE_NEW = "data/gold_live_new.csv"       # bảng dữ liệu
 OUT_RAW_LOG = "data/gold_live_raw_new.log"     # raw JSON log (1 dòng / snapshot)
+OUT_TABLE_CLEAN = "data/gold_clean_new.csv"    # bảng dữ liệu đã clean
+
+# ========== DATA RETENTION ==========
+KEEP_LAST_N_DAYS = 2  # Số ngày dữ liệu giữ lại (tự động xóa dữ liệu cũ hơn)
 
 # ========== SHEET NAMES ==========
 SHEET_PRICE = "GOLD_PRICE"   # sheet chứa bảng giá dạng table
@@ -262,12 +266,140 @@ def append_dedup_raw_log(df_raw: pd.DataFrame) -> None:
     print(f"✅ Raw log updated: {OUT_RAW_LOG} wrote={wrote} skipped_existing={skipped}")
 
 
+# =============================================================================
+# DATA RETENTION: Tự động giữ lại chỉ N ngày gần nhất
+# =============================================================================
+
+def cleanup_csv_keep_last_n_days(file_path: str, date_column: str = "Ngày", n_days: int = KEEP_LAST_N_DAYS) -> None:
+    """
+    Xóa dữ liệu cũ trong file CSV, chỉ giữ lại n_days ngày gần nhất.
+    
+    Args:
+        file_path: Đường dẫn đến file CSV
+        date_column: Tên cột chứa ngày
+        n_days: Số ngày giữ lại
+    """
+    if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
+        return
+    
+    try:
+        df = pd.read_csv(file_path, dtype=str, keep_default_na=False)
+        
+        if date_column not in df.columns:
+            print(f"⚠️ Column '{date_column}' not found in {file_path}")
+            return
+        
+        # Lấy danh sách ngày unique và sắp xếp giảm dần
+        unique_dates = sorted(df[date_column].unique(), reverse=True)
+        
+        if len(unique_dates) <= n_days:
+            print(f"📌 {file_path}: Chỉ có {len(unique_dates)} ngày, không cần cleanup")
+            return
+        
+        # Giữ lại n_days ngày gần nhất
+        keep_dates = unique_dates[:n_days]
+        before_count = len(df)
+        df_filtered = df[df[date_column].isin(keep_dates)]
+        after_count = len(df_filtered)
+        
+        # Ghi lại file
+        df_filtered.to_csv(file_path, index=False, encoding="utf-8-sig")
+        
+        removed_dates = unique_dates[n_days:]
+        print(f"🧹 Cleanup {file_path}: {before_count} -> {after_count} rows")
+        print(f"   Giữ lại: {keep_dates}")
+        print(f"   Đã xóa: {removed_dates}")
+        
+    except Exception as e:
+        print(f"⚠️ Error cleaning up {file_path}: {e}")
+
+
+def cleanup_log_keep_last_n_days(file_path: str, n_days: int = KEEP_LAST_N_DAYS) -> None:
+    """
+    Xóa dữ liệu cũ trong file LOG, chỉ giữ lại n_days ngày gần nhất.
+    
+    Format log: "YYYY-MM-DD HH:MM:SS.ffffff {...json...}"
+    
+    Args:
+        file_path: Đường dẫn đến file log
+        n_days: Số ngày giữ lại
+    """
+    if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
+        return
+    
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        
+        if not lines:
+            return
+        
+        # Lấy danh sách ngày unique từ mỗi dòng log
+        # Format: "YYYY-MM-DD HH:MM:SS..." -> lấy 10 ký tự đầu
+        dates = set()
+        for line in lines:
+            line = line.strip()
+            if line:
+                date_part = line[:10]  # YYYY-MM-DD
+                if len(date_part) == 10 and date_part[4] == '-' and date_part[7] == '-':
+                    dates.add(date_part)
+        
+        # Sắp xếp giảm dần và lấy n_days ngày gần nhất
+        sorted_dates = sorted(dates, reverse=True)
+        
+        if len(sorted_dates) <= n_days:
+            print(f"📌 {file_path}: Chỉ có {len(sorted_dates)} ngày, không cần cleanup")
+            return
+        
+        keep_dates = set(sorted_dates[:n_days])
+        
+        # Lọc các dòng thuộc ngày cần giữ
+        before_count = len(lines)
+        filtered_lines = []
+        for line in lines:
+            line_stripped = line.strip()
+            if line_stripped:
+                date_part = line_stripped[:10]
+                if date_part in keep_dates:
+                    filtered_lines.append(line)
+        
+        after_count = len(filtered_lines)
+        
+        # Ghi lại file
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.writelines(filtered_lines)
+        
+        removed_dates = sorted_dates[n_days:]
+        print(f"🧹 Cleanup {file_path}: {before_count} -> {after_count} lines")
+        print(f"   Giữ lại: {list(keep_dates)}")
+        print(f"   Đã xóa: {removed_dates}")
+        
+    except Exception as e:
+        print(f"⚠️ Error cleaning up {file_path}: {e}")
+
+
+def cleanup_old_data() -> None:
+    """
+    Dọn dẹp dữ liệu cũ trong tất cả các file output.
+    Chỉ giữ lại KEEP_LAST_N_DAYS ngày gần nhất.
+    """
+    print(f"\n🔄 Cleanup: Giữ lại {KEEP_LAST_N_DAYS} ngày gần nhất...")
+    
+    # Cleanup các file CSV
+    cleanup_csv_keep_last_n_days(OUT_TABLE_NEW, date_column="Ngày")
+    cleanup_csv_keep_last_n_days(OUT_TABLE_CLEAN, date_column="Ngày")
+    
+    # Cleanup file log
+    cleanup_log_keep_last_n_days(OUT_RAW_LOG)
+
+
 def main():
     """
     Luồng tổng:
     1) Tải XLSX từ Google Sheets
     2) Update raw log (dedup timestamp)
     3) Update table csv (dedup snapshot+code)
+    4) Cleanup: Giữ lại chỉ N ngày gần nhất
     """
     print("🔄 Đang tải dữ liệu từ Google Sheet (XLSX export)...")
     df_price, df_raw = fetch_from_sheets(INPUT_XLSX_URL)
@@ -277,6 +409,11 @@ def main():
 
     # 2) Table: GOLD_PRICE -> CSV (dedup by Ngày|Thời điểm cập nhật giá mới|Mã vàng)
     save_dedup_table(df_price)
+
+    # 3) Cleanup: Xóa dữ liệu cũ, chỉ giữ lại N ngày gần nhất
+    cleanup_old_data()
+    
+    print("\n✅ Hoàn tất cập nhật dữ liệu!")
 
 
 if __name__ == "__main__":
