@@ -2,21 +2,23 @@
 # -*- coding: utf-8 -*-
 
 """
-DSS Gold - Webgia Interest Pipeline (FIXED 12M COLUMN + 2 TIMESTAMPS)
-======================================================================
+DSS Gold - Webgia Interest Pipeline (v2.1, TOP3 TRUSTED + Alias/Fuzzy Hardened)
+=================================================================================
 - Crawl: https://webgia.com/lai-suat/
-- Lấy bảng lãi suất tiền gửi từ DOM đã render (Playwright)
-- Xác định CHÍNH XÁC cột 12 tháng bằng map header kỳ hạn (không dùng index cứng)
+- Parse bảng lãi suất tiền gửi (DOM render bằng Playwright)
+- Lấy đúng kỳ hạn 12 tháng (header map + offset fix)
 - Tính:
-    interest_rate_state  = AVG(Big4: Vietcombank, BIDV, Agribank, VietinBank)
-    interest_rate_market = MAX(private banks)
-- Xuất:
-    1) webgia_laisuat_latest_clean.csv   (chi tiết bank + rate12)
-    2) macro_features_latest.csv         (1 dòng feature mới nhất)
-- Có retry; optional scheduler mỗi 30 phút
-- Thêm 2 mốc thời gian:
-    updated_at_vn     : giờ VN khi crawler chạy
-    updated_at_webgia : giờ cập nhật từ trang webgia (nếu parse được)
+    interest_rate_state  = AVG(Big4)
+    interest_rate_market = AVG(Top 3 trusted private)
+      + fallback an toàn khi thiếu trusted
+- Output:
+    data/interest_rate/webgia_laisuat_latest_clean.csv
+    data/interest_rate/macro_features_latest.csv
+    data/interest_rate/debug_webgia.png
+- Có retry + optional scheduler
+- Có 2 timestamp:
+    updated_at_vn, updated_at_webgia
+- Có log debug unmatched private để bổ sung alias nhanh
 """
 
 import re
@@ -24,6 +26,7 @@ import time
 import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from pathlib import Path
 from typing import List, Dict, Any, Tuple
 
 import pandas as pd
@@ -34,16 +37,20 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 # =========================
 URL = "https://webgia.com/lai-suat/"
 
-OUT_RATES_CSV = "webgia_laisuat_latest_clean.csv"
-OUT_FEATURE_CSV = "macro_features_latest.csv"
-OUT_DEBUG_SCREENSHOT = "debug_webgia.png"
+OUT_RATES_CSV = "data/interest_rate/webgia_laisuat_latest_clean.csv"
+OUT_FEATURE_CSV = "data/interest_rate/macro_features_latest.csv"
+OUT_DEBUG_SCREENSHOT = "data/interest_rate/debug_webgia.png"
 
 BIG4 = {"Vietcombank", "BIDV", "Agribank", "VietinBank"}
+
+# Trusted private
+TRUSTED_PRIVATE = {"Techcombank", "VPBank", "MB", "ACB", "Sacombank", "VIB", "HDBank"}
+
 TARGET_TERM_MONTH = 12
 TARGET_TERM_TEXT = "12 tháng"
 
-HEADLESS = True              # debug => False
-ENABLE_SCHEDULER = False     # True nếu muốn chạy lặp
+HEADLESS = True
+ENABLE_SCHEDULER = False
 RUN_EVERY_MINUTES = 30
 
 MAX_RETRIES = 3
@@ -114,7 +121,14 @@ def normalize_text_key(s: Any) -> str:
     return strip_accents_vn(norm_space(s)).lower()
 
 
-def parse_rate(value: Any) -> float:
+def canonical_key(s: Any) -> str:
+    """Chuẩn hóa để match alias chắc chắn hơn."""
+    t = normalize_text_key(s)
+    t = re.sub(r"[^a-z0-9]", "", t)
+    return t
+
+
+def parse_rate(value: Any):
     """
     Parse '4,70' / '4.70' / '-' -> float or None
     """
@@ -135,25 +149,109 @@ def parse_rate(value: Any) -> float:
 
 
 def normalize_bank_name(name: Any) -> str:
-    s = norm_space(name)
-    k = s.lower()
+    raw = norm_space(name)
+    k = canonical_key(raw)
+
     alias = {
+        # ===== Big4 =====
         "vietcombank": "Vietcombank",
+        "nganhangvietcombank": "Vietcombank",
+
         "bidv": "BIDV",
+        "nganhangbidv": "BIDV",
+        "dautuvaphattrienvietnam": "BIDV",
+
         "agribank": "Agribank",
+        "nganhangnongnghiepvaphattriennongthon": "Agribank",
+
         "vietinbank": "VietinBank",
-        "vietin bank": "VietinBank",
+        "vietinbankctg": "VietinBank",
+        "nganhangcongthuong": "VietinBank",
+
+        # ===== Trusted private =====
+        # Techcombank
+        "techcombank": "Techcombank",
+        "tcb": "Techcombank",
+        "kythuong": "Techcombank",
+        "nganhangkythuong": "Techcombank",
+        "nganhangkythuongvietnam": "Techcombank",
+
+        # VPBank
         "vpbank": "VPBank",
-        "hdbank": "HDBank",
-        "vib": "VIB",
-        "mb bank": "MB",
+        "vpb": "VPBank",
+        "vietnamprosperity": "VPBank",
+        "thinhvuong": "VPBank",
+        "nganhangvietnamthinhvuong": "VPBank",
+
+        # MB
         "mb": "MB",
+        "mbbank": "MB",
+        "quandoi": "MB",
+        "nganhangquandoi": "MB",
+        "nganhangtmcppquandoi": "MB",
+
+        # ACB
+        "acb": "ACB",
+        "achau": "ACB",
+        "nganhangachau": "ACB",
+        "nganhangthuongmaicophanachau": "ACB",
+
+        # Sacombank
+        "sacombank": "Sacombank",
+        "stb": "Sacombank",
+        "saigonthuongtin": "Sacombank",
+        "nganhangsaigonthuongtin": "Sacombank",
+
+        # VIB
+        "vib": "VIB",
+        "vibbank": "VIB",
+        "quocte": "VIB",
+        "nganhangquocte": "VIB",
+        "nganhangquoctevietnam": "VIB",
+        "vietnaminternationalbank": "VIB",
+
+        # HDBank
+        "hdbank": "HDBank",
+        "hdb": "HDBank",
+        "hochiminhcitydevelopmentbank": "HDBank",
+        "phattrientphcm": "HDBank",
+        "nganhangphattrientphcm": "HDBank",
     }
-    return alias.get(k, s)
+
+    if k in alias:
+        return alias[k]
+
+    # ===== Fuzzy fallback (an toàn, chỉ các ngân hàng mục tiêu) =====
+    if "techcombank" in k or "kythuong" in k or k == "tcb":
+        return "Techcombank"
+    if "achau" in k or k == "acb":
+        return "ACB"
+    if "saigonthuongtin" in k or "sacombank" in k or k == "stb":
+        return "Sacombank"
+    if "quocte" in k or "vietnaminternationalbank" in k or k in {"vib", "vibbank"}:
+        return "VIB"
+    if "hdbank" in k or "phattrientphcm" in k or k == "hdb":
+        return "HDBank"
+    if "quandoi" in k or k in {"mb", "mbbank"}:
+        return "MB"
+    if "thinhvuong" in k or "vpbank" in k or k == "vpb":
+        return "VPBank"
+
+    # Big4 fuzzy
+    if "vietcombank" in k:
+        return "Vietcombank"
+    if k == "bidv" or "dautuvaphattrien" in k:
+        return "BIDV"
+    if "agribank" in k or "nongnghiepvaphattriennongthon" in k:
+        return "Agribank"
+    if "vietinbank" in k or "congthuong" in k:
+        return "VietinBank"
+
+    return raw
 
 
 def is_header_like_bank_text(s: str) -> bool:
-    t = normalize_text_key(s).replace(" ", "")
+    t = canonical_key(s)
     bad_tokens = [
         "nganhang", "kyhantietkiem", "kyhan", "laisuat", "khongkyhan",
         "thang", "jpy", "usd", "eur"
@@ -161,22 +259,33 @@ def is_header_like_bank_text(s: str) -> bool:
     return any(tok in t for tok in bad_tokens)
 
 
+TRUSTED_PRIVATE_KEY = {canonical_key(x) for x in TRUSTED_PRIVATE}
+
+
+# =========================
+# FS UTILS
+# =========================
+def ensure_output_dirs():
+    for p in [OUT_RATES_CSV, OUT_FEATURE_CSV, OUT_DEBUG_SCREENSHOT]:
+        Path(p).parent.mkdir(parents=True, exist_ok=True)
+
+
 # =========================
 # PAGE TIME PARSER
 # =========================
 def extract_webgia_updated_at(page) -> str:
     """
-    Cố gắng parse thời gian cập nhật từ nội dung trang.
-    Trả về 'YYYY-MM-DD HH:MM:SS' (VN) hoặc '' nếu không parse được.
+    Parse thời gian cập nhật hiển thị trên webgia (nếu có).
+    Return: 'YYYY-MM-DD HH:MM:SS' hoặc ''.
     """
     body_text = page.evaluate("() => document.body ? document.body.innerText : ''")
     text_raw = norm_space(body_text)
     text = strip_accents_vn(text_raw).lower()
 
     patterns = [
-        # "Cập nhật lúc 17:33 05/02/2026" hoặc "cap nhat luc 17:33:20 05/02/2026"
+        # "cập nhật lúc 17:33 05/02/2026"
         r"cap nhat(?: luc)?\s*(\d{1,2}:\d{2})(?::(\d{2}))?\s*(\d{1,2}/\d{1,2}/\d{4})",
-        # "Cập nhật: 05/02/2026 17:33"
+        # "cập nhật: 05/02/2026 17:33"
         r"cap nhat[:\s]*?(\d{1,2}/\d{1,2}/\d{4})\s*(\d{1,2}:\d{2})(?::(\d{2}))?",
     ]
 
@@ -212,9 +321,6 @@ def extract_webgia_updated_at(page) -> str:
 # DOM EXTRACTION
 # =========================
 def extract_table_rows_from_dom(page) -> List[List[str]]:
-    """
-    Lấy rows từ table 'phù hợp nhất' trên trang.
-    """
     rows = page.evaluate(
         """
         () => {
@@ -236,7 +342,6 @@ def extract_table_rows_from_dom(page) -> List[List[str]]:
             for (const tm of terms) if (text.includes(tm)) score += 8;
 
             score += trCount;
-
             if (text.includes("jpy") || text.includes("usd") || text.includes("eur")) score -= 30;
             if (trCount < 8) score -= 20;
 
@@ -264,10 +369,8 @@ def extract_table_rows_from_dom(page) -> List[List[str]]:
 
 def detect_header_and_term_col(rows: List[List[str]]) -> Tuple[int, int, Dict[int, int]]:
     """
-    Tìm:
-    - header_row_idx: hàng chứa kỳ hạn 01/03/06/09/12...
-    - bank_col_idx
-    - term_col_map: {1:col,3:col,6:col,9:col,12:col,...}
+    Return:
+      header_row_idx, bank_col_idx, term_col_map
     """
     header_row_idx = -1
     bank_col_idx = 0
@@ -310,39 +413,31 @@ def rows_to_rate12_dataframe(rows: List[List[str]]) -> pd.DataFrame:
         return pd.DataFrame(columns=["ngan_hang", "rate12"])
 
     header_idx, bank_col, term_map = detect_header_and_term_col(rows)
-
     term12_col = term_map.get(TARGET_TERM_MONTH)
+
     if term12_col is None:
         raise RuntimeError(f"Không tìm thấy cột {TARGET_TERM_MONTH} tháng. term_map={term_map}")
 
-    # ===== FIX OFFSET do rowspan/colspan header =====
+    # FIX lệch cột do header rowspan/colspan
     header_cells_norm = [normalize_text_key(x) for x in rows[header_idx]]
     header_has_bank = any("ngan hang" in x for x in header_cells_norm)
     if bank_col == 0 and not header_has_bank:
         term12_col += 1
-    # ===============================================
 
     logger.info(
         f"header_idx={header_idx}, bank_col={bank_col}, term12_col={term12_col}, "
         f"term_map={term_map}, header_has_bank={header_has_bank}"
     )
 
-    data_rows = rows[header_idx + 1:]
     parsed = []
+    data_rows = rows[header_idx + 1:]
 
     for r in data_rows:
-        if bank_col >= len(r):
+        if bank_col >= len(r) or term12_col >= len(r):
             continue
 
-        bank_raw = r[bank_col]
-        bank = normalize_bank_name(bank_raw)
-
-        if not bank or len(bank) < 2:
-            continue
-        if is_header_like_bank_text(bank):
-            continue
-
-        if term12_col >= len(r):
+        bank = normalize_bank_name(r[bank_col])
+        if not bank or len(bank) < 2 or is_header_like_bank_text(bank):
             continue
 
         rate12 = parse_rate(r[term12_col])
@@ -368,17 +463,29 @@ def compute_features(df_rate12: pd.DataFrame, updated_at_webgia: str) -> pd.Data
     df = df_rate12.copy()
     df["group"] = df["ngan_hang"].apply(lambda b: "big4" if b in BIG4 else "private")
 
-    big4_df = df[df["group"] == "big4"]
-    private_df = df[df["group"] == "private"]
+    big4_df = df[df["group"] == "big4"].copy()
+    private_df = df[df["group"] == "private"].copy()
+
+    trusted_df = private_df[
+        private_df["ngan_hang"].apply(lambda x: canonical_key(x) in TRUSTED_PRIVATE_KEY)
+    ].copy()
 
     big4_used = sorted(big4_df["ngan_hang"].unique().tolist())
     private_used = sorted(private_df["ngan_hang"].unique().tolist())
+    trusted_used = sorted(trusted_df["ngan_hang"].unique().tolist())
 
     logger.info(f"Parsed banks with 12M: {len(df)}")
     logger.info(f"Big4 used: {big4_used}")
     logger.info(f"Private count: {len(private_used)}")
+    logger.info(f"Trusted private count: {len(trusted_used)}")
 
-    # Debug check để chắc chắn không lệch sang 9 tháng
+    # Log unmatched private để bổ sung alias nhanh
+    private_names = sorted(private_df["ngan_hang"].unique().tolist())
+    unmatched = [x for x in private_names if canonical_key(x) not in TRUSTED_PRIVATE_KEY]
+    logger.info(f"Private names ({len(private_names)}): {private_names}")
+    logger.info(f"Trusted matched ({len(trusted_used)}): {trusted_used}")
+    logger.info(f"Unmatched private ({len(unmatched)}): {unmatched}")
+
     sample_big4 = df[df["ngan_hang"].isin(["Agribank", "BIDV", "Vietcombank", "VietinBank"])]
     logger.info("Big4 rate12 sample = %s", sample_big4.to_dict(orient="records"))
 
@@ -388,20 +495,47 @@ def compute_features(df_rate12: pd.DataFrame, updated_at_webgia: str) -> pd.Data
         raise RuntimeError(f"Thiếu dữ liệu private (có {len(private_used)})")
 
     interest_rate_state = round(float(big4_df["rate12"].mean()), 2)
-    interest_rate_market = round(float(private_df["rate12"].max()), 2)
+
+    market_method = "top3_trusted_mean"
+    trusted_count = int(trusted_df["ngan_hang"].nunique())
+
+    if trusted_count >= 3:
+        top3 = trusted_df.sort_values("rate12", ascending=False).head(3)
+        interest_rate_market = round(float(top3["rate12"].mean()), 2)
+        trusted_top3_used = ", ".join(top3["ngan_hang"].tolist())
+        trusted_top3_rates = ", ".join([str(x) for x in top3["rate12"].tolist()])
+    elif trusted_count >= 1:
+        market_method = "fallback_trusted_mean"
+        topk = trusted_df.sort_values("rate12", ascending=False)
+        interest_rate_market = round(float(topk["rate12"].mean()), 2)
+        trusted_top3_used = ", ".join(topk["ngan_hang"].tolist())
+        trusted_top3_rates = ", ".join([str(x) for x in topk["rate12"].tolist()])
+    else:
+        market_method = "fallback_max_private"
+        top1 = private_df.sort_values("rate12", ascending=False).head(1)
+        interest_rate_market = round(float(top1["rate12"].iloc[0]), 2)
+        trusted_top3_used = ", ".join(top1["ngan_hang"].tolist())
+        trusted_top3_rates = ", ".join([str(x) for x in top1["rate12"].tolist()])
+
     spread = round(interest_rate_market - interest_rate_state, 2)
 
     feature = pd.DataFrame([{
         "updated_at_vn": now_vn_str(),
-        "updated_at_webgia": updated_at_webgia,   # có thể rỗng nếu không parse được
+        "updated_at_webgia": updated_at_webgia,
         "interest_rate_state": interest_rate_state,
         "interest_rate_market": interest_rate_market,
         "interest_rate_spread": spread,
+
+        "market_method": market_method,
+        "trusted_count": trusted_count,
+        "trusted_top3_used": trusted_top3_used,
+        "trusted_top3_rates": trusted_top3_rates,
+
         "n_big4": len(big4_used),
         "n_private": len(private_used),
         "big4_used": ", ".join(big4_used),
         "source": URL,
-        "note": f"term={TARGET_TERM_TEXT} | state=AVG(Big4) | market=MAX(private)"
+        "note": f"term={TARGET_TERM_TEXT} | state=AVG(Big4) | market=TOP3_TRUSTED_MEAN"
     }])
 
     return feature
@@ -411,6 +545,8 @@ def compute_features(df_rate12: pd.DataFrame, updated_at_webgia: str) -> pd.Data
 # CORE RUN
 # =========================
 def run_once() -> None:
+    ensure_output_dirs()
+
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=HEADLESS,
@@ -432,22 +568,19 @@ def run_once() -> None:
 
         page.wait_for_timeout(RENDER_WAIT_MS)
 
-        # debug screenshot
+        # screenshot debug
         page.screenshot(path=OUT_DEBUG_SCREENSHOT, full_page=True)
 
         # parse thời gian cập nhật từ webgia
         updated_at_webgia = extract_webgia_updated_at(page)
-        if updated_at_webgia:
-            logger.info(f"updated_at_webgia parsed: {updated_at_webgia}")
-        else:
-            logger.info("updated_at_webgia parsed: (empty)")
+        logger.info(f"updated_at_webgia parsed: {updated_at_webgia if updated_at_webgia else '(empty)'}")
 
         rows = extract_table_rows_from_dom(page)
         browser.close()
 
     logger.info(f"Extracted rows from DOM: {len(rows)}")
     if not rows:
-        raise RuntimeError("DOM không có table rows (có thể bị anti-bot hoặc trang chưa render).")
+        raise RuntimeError("DOM không có table rows (có thể anti-bot hoặc trang chưa render).")
 
     df_rate12 = rows_to_rate12_dataframe(rows)
     if df_rate12.empty:
@@ -493,7 +626,7 @@ def start_scheduler():
 
 if __name__ == "__main__":
     if ENABLE_SCHEDULER:
-        run_with_retry()   # chạy ngay 1 lần
-        start_scheduler()  # rồi chạy định kỳ
+        run_with_retry()
+        start_scheduler()
     else:
         run_with_retry()
