@@ -40,7 +40,7 @@ jobs:
               run: |
                   git config user.name "github-actions[bot]"
                   git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-                  git add data/interest_rate/macro_features_latest.csv data/interest_rate/webgia_laisuat_latest_clean.csv data/interest_rate/debug_webgia.png || true
+                  git add macro_features_latest.csv webgia_laisuat_latest_clean.csv debug_webgia.png || true
                   if git diff --cached --quiet; then
                     echo "No changes"
                   else
