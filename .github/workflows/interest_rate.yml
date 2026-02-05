@@ -24,7 +24,8 @@ jobs:
               run: |
                   pwd
                   ls -la
-                  ls -la interest_rate || true
+                  ls -la data || true
+                  ls -la data/interest_rate || true
 
             - name: Install deps
               run: |
@@ -33,13 +34,13 @@ jobs:
                   python -m playwright install --with-deps chromium
 
             - name: Run crawler
-              run: python interest_rate/transcribe.py
+              run: python data/interest_rate/transcribe.py
 
             - name: Commit if changed
               run: |
                   git config user.name "github-actions[bot]"
                   git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-                  git add interest_rate/macro_features_latest.csv interest_rate/webgia_laisuat_latest_clean.csv interest_rate/debug_webgia.png || true
+                  git add data/interest_rate/macro_features_latest.csv data/interest_rate/webgia_laisuat_latest_clean.csv data/interest_rate/debug_webgia.png || true
                   if git diff --cached --quiet; then
                     echo "No changes"
                   else
