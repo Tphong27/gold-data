@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-DSS Gold - Webgia Interest Pipeline (FIXED 12M COLUMN)
-======================================================
+DSS Gold - Webgia Interest Pipeline (FIXED 12M COLUMN + 2 TIMESTAMPS)
+======================================================================
 - Crawl: https://webgia.com/lai-suat/
 - Lấy bảng lãi suất tiền gửi từ DOM đã render (Playwright)
 - Xác định CHÍNH XÁC cột 12 tháng bằng map header kỳ hạn (không dùng index cứng)
@@ -14,12 +14,16 @@ DSS Gold - Webgia Interest Pipeline (FIXED 12M COLUMN)
     1) webgia_laisuat_latest_clean.csv   (chi tiết bank + rate12)
     2) macro_features_latest.csv         (1 dòng feature mới nhất)
 - Có retry; optional scheduler mỗi 30 phút
+- Thêm 2 mốc thời gian:
+    updated_at_vn     : giờ VN khi crawler chạy
+    updated_at_webgia : giờ cập nhật từ trang webgia (nếu parse được)
 """
 
 import re
 import time
 import logging
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import List, Dict, Any, Tuple
 
 import pandas as pd
@@ -48,6 +52,8 @@ SLEEP_BETWEEN_RETRIES_SEC = 3
 PAGE_TIMEOUT_MS = 90000
 RENDER_WAIT_MS = 8000
 
+VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
+
 # =========================
 # LOGGING
 # =========================
@@ -56,6 +62,13 @@ logging.basicConfig(
     format="[%(asctime)s] %(levelname)s - %(message)s"
 )
 logger = logging.getLogger("webgia_pipeline")
+
+
+# =========================
+# TIME UTILS
+# =========================
+def now_vn_str() -> str:
+    return datetime.now(VN_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 
 # =========================
@@ -146,6 +159,53 @@ def is_header_like_bank_text(s: str) -> bool:
         "thang", "jpy", "usd", "eur"
     ]
     return any(tok in t for tok in bad_tokens)
+
+
+# =========================
+# PAGE TIME PARSER
+# =========================
+def extract_webgia_updated_at(page) -> str:
+    """
+    Cố gắng parse thời gian cập nhật từ nội dung trang.
+    Trả về 'YYYY-MM-DD HH:MM:SS' (VN) hoặc '' nếu không parse được.
+    """
+    body_text = page.evaluate("() => document.body ? document.body.innerText : ''")
+    text_raw = norm_space(body_text)
+    text = strip_accents_vn(text_raw).lower()
+
+    patterns = [
+        # "Cập nhật lúc 17:33 05/02/2026" hoặc "cap nhat luc 17:33:20 05/02/2026"
+        r"cap nhat(?: luc)?\s*(\d{1,2}:\d{2})(?::(\d{2}))?\s*(\d{1,2}/\d{1,2}/\d{4})",
+        # "Cập nhật: 05/02/2026 17:33"
+        r"cap nhat[:\s]*?(\d{1,2}/\d{1,2}/\d{4})\s*(\d{1,2}:\d{2})(?::(\d{2}))?",
+    ]
+
+    for i, p in enumerate(patterns):
+        m = re.search(p, text, flags=re.IGNORECASE)
+        if not m:
+            continue
+        try:
+            if i == 0:
+                hhmm = m.group(1)
+                ss = m.group(2) or "00"
+                dmy = m.group(3)
+            else:
+                dmy = m.group(1)
+                hhmm = m.group(2)
+                ss = m.group(3) or "00"
+
+            d, mo, y = dmy.split("/")
+            h, mi = hhmm.split(":")
+            dt = datetime(
+                int(y), int(mo), int(d),
+                int(h), int(mi), int(ss),
+                tzinfo=VN_TZ
+            )
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass
+
+    return ""
 
 
 # =========================
@@ -244,6 +304,7 @@ def detect_header_and_term_col(rows: List[List[str]]) -> Tuple[int, int, Dict[in
 
     return header_row_idx, bank_col_idx, term_col_map
 
+
 def rows_to_rate12_dataframe(rows: List[List[str]]) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame(columns=["ngan_hang", "rate12"])
@@ -300,7 +361,7 @@ def rows_to_rate12_dataframe(rows: List[List[str]]) -> pd.DataFrame:
 # =========================
 # FEATURE
 # =========================
-def compute_features(df_rate12: pd.DataFrame) -> pd.DataFrame:
+def compute_features(df_rate12: pd.DataFrame, updated_at_webgia: str) -> pd.DataFrame:
     if df_rate12.empty:
         raise RuntimeError("Không có dữ liệu rate12 để tính feature.")
 
@@ -331,7 +392,8 @@ def compute_features(df_rate12: pd.DataFrame) -> pd.DataFrame:
     spread = round(interest_rate_market - interest_rate_state, 2)
 
     feature = pd.DataFrame([{
-        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "updated_at_vn": now_vn_str(),
+        "updated_at_webgia": updated_at_webgia,   # có thể rỗng nếu không parse được
         "interest_rate_state": interest_rate_state,
         "interest_rate_market": interest_rate_market,
         "interest_rate_spread": spread,
@@ -373,6 +435,13 @@ def run_once() -> None:
         # debug screenshot
         page.screenshot(path=OUT_DEBUG_SCREENSHOT, full_page=True)
 
+        # parse thời gian cập nhật từ webgia
+        updated_at_webgia = extract_webgia_updated_at(page)
+        if updated_at_webgia:
+            logger.info(f"updated_at_webgia parsed: {updated_at_webgia}")
+        else:
+            logger.info("updated_at_webgia parsed: (empty)")
+
         rows = extract_table_rows_from_dom(page)
         browser.close()
 
@@ -388,7 +457,7 @@ def run_once() -> None:
     df_rate12.to_csv(OUT_RATES_CSV, index=False, encoding="utf-8-sig")
 
     # compute + save feature
-    feature_df = compute_features(df_rate12)
+    feature_df = compute_features(df_rate12, updated_at_webgia)
     feature_df.to_csv(OUT_FEATURE_CSV, index=False, encoding="utf-8-sig")
 
     logger.info("SUCCESS")
