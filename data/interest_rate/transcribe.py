@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-DSS Gold - Webgia Interest Pipeline (v2.1, TOP3 TRUSTED + Alias/Fuzzy Hardened)
-=================================================================================
+DSS Gold - Webgia Interest Pipeline (v2.1, ROOT OUTPUT)
+========================================================
 - Crawl: https://webgia.com/lai-suat/
 - Parse bảng lãi suất tiền gửi (DOM render bằng Playwright)
 - Lấy đúng kỳ hạn 12 tháng (header map + offset fix)
@@ -11,10 +11,10 @@ DSS Gold - Webgia Interest Pipeline (v2.1, TOP3 TRUSTED + Alias/Fuzzy Hardened)
     interest_rate_state  = AVG(Big4)
     interest_rate_market = AVG(Top 3 trusted private)
       + fallback an toàn khi thiếu trusted
-- Output:
-    data/interest_rate/webgia_laisuat_latest_clean.csv
-    data/interest_rate/macro_features_latest.csv
-    data/interest_rate/debug_webgia.png
+- Output ở THƯ MỤC GỐC:
+    webgia_laisuat_latest_clean.csv
+    macro_features_latest.csv
+    debug_webgia.png
 - Có retry + optional scheduler
 - Có 2 timestamp:
     updated_at_vn, updated_at_webgia
@@ -37,9 +37,10 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 # =========================
 URL = "https://webgia.com/lai-suat/"
 
-OUT_RATES_CSV = "data/interest_rate/webgia_laisuat_latest_clean.csv"
-OUT_FEATURE_CSV = "data/interest_rate/macro_features_latest.csv"
-OUT_DEBUG_SCREENSHOT = "data/interest_rate/debug_webgia.png"
+# ===== OUTPUT RA ROOT =====
+OUT_RATES_CSV = "webgia_laisuat_latest_clean.csv"
+OUT_FEATURE_CSV = "macro_features_latest.csv"
+OUT_DEBUG_SCREENSHOT = "debug_webgia.png"
 
 BIG4 = {"Vietcombank", "BIDV", "Agribank", "VietinBank"}
 
@@ -221,7 +222,7 @@ def normalize_bank_name(name: Any) -> str:
     if k in alias:
         return alias[k]
 
-    # ===== Fuzzy fallback (an toàn, chỉ các ngân hàng mục tiêu) =====
+    # ===== Fuzzy fallback =====
     if "techcombank" in k or "kythuong" in k or k == "tcb":
         return "Techcombank"
     if "achau" in k or k == "acb":
@@ -266,26 +267,23 @@ TRUSTED_PRIVATE_KEY = {canonical_key(x) for x in TRUSTED_PRIVATE}
 # FS UTILS
 # =========================
 def ensure_output_dirs():
+    # Với output ở root thì parent="." => không cần mkdir
     for p in [OUT_RATES_CSV, OUT_FEATURE_CSV, OUT_DEBUG_SCREENSHOT]:
-        Path(p).parent.mkdir(parents=True, exist_ok=True)
+        parent = Path(p).parent
+        if str(parent) != ".":
+            parent.mkdir(parents=True, exist_ok=True)
 
 
 # =========================
 # PAGE TIME PARSER
 # =========================
 def extract_webgia_updated_at(page) -> str:
-    """
-    Parse thời gian cập nhật hiển thị trên webgia (nếu có).
-    Return: 'YYYY-MM-DD HH:MM:SS' hoặc ''.
-    """
     body_text = page.evaluate("() => document.body ? document.body.innerText : ''")
     text_raw = norm_space(body_text)
     text = strip_accents_vn(text_raw).lower()
 
     patterns = [
-        # "cập nhật lúc 17:33 05/02/2026"
         r"cap nhat(?: luc)?\s*(\d{1,2}:\d{2})(?::(\d{2}))?\s*(\d{1,2}/\d{1,2}/\d{4})",
-        # "cập nhật: 05/02/2026 17:33"
         r"cap nhat[:\s]*?(\d{1,2}/\d{1,2}/\d{4})\s*(\d{1,2}:\d{2})(?::(\d{2}))?",
     ]
 
@@ -305,11 +303,7 @@ def extract_webgia_updated_at(page) -> str:
 
             d, mo, y = dmy.split("/")
             h, mi = hhmm.split(":")
-            dt = datetime(
-                int(y), int(mo), int(d),
-                int(h), int(mi), int(ss),
-                tzinfo=VN_TZ
-            )
+            dt = datetime(int(y), int(mo), int(d), int(h), int(mi), int(ss), tzinfo=VN_TZ)
             return dt.strftime("%Y-%m-%d %H:%M:%S")
         except Exception:
             pass
@@ -368,10 +362,6 @@ def extract_table_rows_from_dom(page) -> List[List[str]]:
 
 
 def detect_header_and_term_col(rows: List[List[str]]) -> Tuple[int, int, Dict[int, int]]:
-    """
-    Return:
-      header_row_idx, bank_col_idx, term_col_map
-    """
     header_row_idx = -1
     bank_col_idx = 0
     term_col_map: Dict[int, int] = {}
@@ -418,7 +408,7 @@ def rows_to_rate12_dataframe(rows: List[List[str]]) -> pd.DataFrame:
     if term12_col is None:
         raise RuntimeError(f"Không tìm thấy cột {TARGET_TERM_MONTH} tháng. term_map={term_map}")
 
-    # FIX lệch cột do header rowspan/colspan
+    # Fix lệch cột do rowspan/colspan
     header_cells_norm = [normalize_text_key(x) for x in rows[header_idx]]
     header_has_bank = any("ngan hang" in x for x in header_cells_norm)
     if bank_col == 0 and not header_has_bank:
@@ -595,6 +585,11 @@ def run_once() -> None:
 
     logger.info("SUCCESS")
     logger.info(feature_df.to_dict(orient="records")[0])
+
+    # log path tuyệt đối để debug
+    logger.info(f"Saved rates : {Path(OUT_RATES_CSV).resolve()}")
+    logger.info(f"Saved macro : {Path(OUT_FEATURE_CSV).resolve()}")
+    logger.info(f"Saved image : {Path(OUT_DEBUG_SCREENSHOT).resolve()}")
 
 
 def run_with_retry():
